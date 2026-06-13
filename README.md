@@ -6,6 +6,21 @@ Built to understand how ISP-level filtering, enterprise firewalls, and parental 
 
 ---
 
+## Why This Matters for ML-Based Network Security
+
+Rule-based DPI (what Netscope does) and ML-based traffic classification are complementary layers in production network security systems. Rule-based systems are fast and interpretable but brittle — they break the moment an app changes its CDN domain or migrates to QUIC. ML-based classifiers (flow-level models like FLOWPRINT, or sequence models over packet inter-arrival times) are more robust to such changes but require structured, labeled flow features to train and evaluate on.
+
+Building Netscope from scratch made concrete what those features actually are and where they come from:
+
+- **5-tuple flows** `(src_ip, dst_ip, src_port, dst_port, protocol)` — the primary key for per-flow ML models
+- **SNI / HTTP Host** — application-layer identity signal, available only in early handshake packets
+- **Flow state** `(NEW → ESTABLISHED → CLASSIFIED → BLOCKED → CLOSED)` — temporal structure that sequence models operate over
+- **Packet timing and count per flow** — the features that remain available when payload inspection fails (e.g. QUIC with encrypted SNI)
+
+The `20% Unknown` flows in Netscope's output — traffic it can't classify by SNI substring match — are exactly the distribution where an ML classifier trained on flow-level features would provide value. Rule-based systems produce their own hardest training examples.
+
+---
+
 ## How It Works
 
 ```
@@ -47,6 +62,8 @@ Extracting it requires navigating a layered structure. After verifying content t
 
 For HTTP, `HTTPHostExtractor` scans for `Host:` case-insensitively, skips whitespace, and reads until `\r\n`, stripping any port suffix.
 
+SNI is also the feature that highlights a core limitation of rule-based DPI: as TLS Encrypted Client Hello (ECH) adoption grows, SNI will no longer be available in plaintext. Traffic classification will need to fall back to flow-level statistical features — packet sizes, inter-arrival times, byte distributions — which is where ML models operate.
+
 ---
 
 ## Flow-Based Blocking
@@ -54,6 +71,8 @@ For HTTP, `HTTPHostExtractor` scans for `Host:` case-insensitively, skips whites
 Blocking a single packet doesn't end a TCP connection — the sender retransmits. Netscope tracks **flows** by 5-tuple `(src_ip, dst_ip, src_port, dst_port, protocol)`. The `Connection` struct tracks state across `NEW → ESTABLISHED → CLASSIFIED → BLOCKED → CLOSED`, driven by TCP flag inspection (SYN, SYN-ACK, FIN, RST).
 
 The early packets of an HTTPS connection (SYN, SYN-ACK, ACK) arrive before the Client Hello, so the flow stays `ESTABLISHED` and packets are forwarded. The moment SNI is extracted and a rule matches, the `Connection` is marked `BLOCKED` — and every subsequent packet on that flow is dropped without re-inspecting the payload. The connection stalls and times out on the client.
+
+This deferred classification pattern — where a decision is made on the first informative packet and propagated to all subsequent packets in the same flow — is the same temporal structure that makes network traffic a natural fit for sequence classification models.
 
 ---
 
@@ -275,13 +294,17 @@ Google, YouTube (`ytimg`, `youtu.be`), Facebook (`fbcdn`, `fbsbx`), Instagram (`
   - github.com       → GitHub
 ```
 
+The `Unknown` bucket — 20.8% of traffic in this capture — represents flows where SNI was unavailable or didn't match any rule pattern. In a production system, this is where an ML classifier operating on flow-level statistical features (packet size distribution, inter-arrival times, byte entropy) would take over from the rule engine.
+
 ---
 
 ## What's Next
 
-**QUIC / HTTP3.** `QUICSNIExtractor` is stubbed — it detects QUIC Initial packets by the long-header form bit and does a naive scan for a Client Hello handshake type byte. Proper implementation requires parsing QUIC frames, finding the `CRYPTO` frame type (`0x06`), and reassembling the TLS Client Hello from potentially fragmented CRYPTO data. QUIC v1 also uses AEAD with a well-known per-version salt for the Initial packet, making the SNI technically recoverable — but significantly more involved than TLS over TCP.
+**QUIC / HTTP3.** `QUICSNIExtractor` is stubbed — it detects QUIC Initial packets by the long-header form bit and does a naive scan for a Client Hello handshake type byte. Proper implementation requires parsing QUIC frames, finding the `CRYPTO` frame type (`0x06`), and reassembling the TLS Client Hello from potentially fragmented CRYPTO data. QUIC v1 also uses AEAD with a well-known per-version salt for the Initial packet, making the SNI technically recoverable — but significantly more involved than TLS over TCP. As QUIC adoption grows (already dominant for YouTube and Google), this also makes SNI-based classification increasingly unreliable, strengthening the case for flow-statistical ML approaches.
 
 **Live capture.** The reader thread currently opens a file. Replacing it with a raw socket (`AF_PACKET` on Linux, `BPF` on macOS) would make Netscope a real-time inspector. The thread architecture already supports this — the reader thread is the only piece that changes.
+
+**ML-based classification for Unknown flows.** The current `sniToAppType()` is a 22-entry substring lookup. A natural extension is exporting per-flow features (packet count, byte count, flow duration, packet size mean/variance, inter-arrival time statistics) for flows that remain `Unknown` after SNI extraction, and training a flow-level classifier on labeled PCAP datasets (ISCX, CICIDS). The existing flow tracking infrastructure produces exactly the data that such a model would need.
 
 **Throttling instead of dropping.** The current `PacketAction` enum has `LOG_ONLY` defined but not wired up. Adding a `THROTTLE` action that delays forwarding in the output queue rather than dropping would enable rate-limiting rather than hard blocking — more realistic for ISP scenarios.
 
