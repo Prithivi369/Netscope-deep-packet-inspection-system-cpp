@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+dpi_engine
+build/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Editors
+.vscode/
+.idea/
+
+
